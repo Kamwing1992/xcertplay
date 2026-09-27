@@ -4,7 +4,7 @@ package com.shilapi.xcertplay.airplay
  * Minimal Apple binary property list (bplist00) codec for the CarPlay control channel.
  *
  * It covers the subset the stack emits and reads: dictionaries, arrays, ASCII and UTF-16
- * strings, raw data, non-negative integers, 32/64-bit reals, and booleans. Dictionary keys are
+ * strings, raw data, signed/unsigned integers, 32/64-bit reals, and booleans. Dictionary keys are
  * serialized in insertion order, matching the reference implementation this stack targets.
  */
 object BplistCodec {
@@ -46,7 +46,9 @@ object BplistCodec {
                     nodes[index] = if (number >= 0) {
                         Leaf(encodeInt(number))
                     } else {
-                        Leaf(byteArrayOf(0x23) + bigEndian(number.toDouble().toRawBits(), 8))
+                        // Binary plist integers are signed two's-complement. Keep negative
+                        // OSStatus and CMTime values as integers rather than lossy reals.
+                        Leaf(byteArrayOf(0x13) + bigEndian(number, 8))
                     }
                 }
                 is Float, is Double -> {

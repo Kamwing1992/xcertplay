@@ -60,6 +60,7 @@ import com.shilapi.xcertplay.airplay.AirPlayIcon
 import com.shilapi.xcertplay.airplay.AirPlaySafeArea
 import com.shilapi.xcertplay.airplay.AirPlaySession
 import com.shilapi.xcertplay.airplay.AirPlaySessionListener
+import com.shilapi.xcertplay.airplay.AirPlayVideoPlaybackConfig
 import com.shilapi.xcertplay.airplay.CarPlayMediaEngine
 import com.shilapi.xcertplay.airplay.SafeAreaRect
 import com.shilapi.xcertplay.host.R
@@ -271,6 +272,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var pendingDisplaySize: DisplaySize? = null
     private var displayScaleTenths = CarPlayDisplayScale.DEFAULT_TENTHS
     private var hevcEnabled = true
+    private var videoPlaybackEnabled = false
     private var hevcSoftwareDecoderEnabled = false
     private var advancedAudioChannelMappingSupported = false
     private var advancedAudioChannelMapping = false
@@ -328,6 +330,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private var edgeSettingsGestureCaptured = false
     private var edgeSettingsGestureEligible = false
     private val shuttingDown = AtomicBoolean(false)
+    private val videoPlaybackTouchSuppressionLogged = AtomicBoolean(false)
     private val mainHandler = Handler(Looper.getMainLooper())
     private val teardownExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private val airPlayCommandExecutor: ExecutorService = Executors.newSingleThreadExecutor()
@@ -418,6 +421,9 @@ class CarPlayHostActivity : ComponentActivity() {
                 override fun handleOnBackPressed() {
                     if (menuOpen) {
                         if (safeAreaEditorActive) closeSafeAreaEditor() else cancelSettingsEdits()
+                    } else if (controller?.isVideoPlaybackActive() == true) {
+                        val sent = controller?.sendVideoPlaybackBackButtonEvent() == true
+                        appendLog("Video playback back button sent=$sent")
                     } else {
                         isEnabled = false
                         onBackPressedDispatcher.onBackPressed()
@@ -447,6 +453,7 @@ class CarPlayHostActivity : ComponentActivity() {
     private fun loadPersistedSettings() {
         displayScaleTenths = AirPlayPersistence.loadDisplayScaleTenths(this)
         hevcEnabled = AirPlayPersistence.loadHevcEnabled(this)
+        videoPlaybackEnabled = AirPlayPersistence.loadVideoPlaybackEnabled(this)
         hevcSoftwareDecoderEnabled =
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
                 AirPlayPersistence.loadHevcSoftwareDecoderEnabled(this)
@@ -1141,6 +1148,27 @@ class CarPlayHostActivity : ComponentActivity() {
             ).apply { topMargin = dp(30) },
         )
 
+        content.addView(
+            settingsSwitchRow(
+                label = "Experimental CarPlay video playback",
+                checked = videoPlaybackEnabled,
+                description =
+                    "Force enabledFeatures.videoPlayback and the iOS 27 playback sidecars. " +
+                        "This is an experimental shared-APTransport receiver.",
+            ) { checked ->
+                videoPlaybackEnabled = checked
+                appendLog(
+                    "Experimental video playback ${if (checked) "enabled" else "disabled"}; " +
+                        "applies when settings close",
+                )
+                updateResolutionMenu()
+            },
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(16) },
+        )
+
         val softwareHevcRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1400,6 +1428,7 @@ class CarPlayHostActivity : ComponentActivity() {
         AirPlayPersistence.saveWidthPhysicalMm(this, widthPhysicalMm)
         AirPlayPersistence.savePhysicalSizeBasis(this, physicalSizeBasis)
         AirPlayPersistence.saveHevcEnabled(this, hevcEnabled)
+        AirPlayPersistence.saveVideoPlaybackEnabled(this, videoPlaybackEnabled)
         AirPlayPersistence.saveHevcSoftwareDecoderEnabled(this, hevcSoftwareDecoderEnabled)
         AirPlayPersistence.saveManufacturer(this, manufacturer)
         AirPlayPersistence.saveModel(this, model)
@@ -2887,6 +2916,10 @@ class CarPlayHostActivity : ComponentActivity() {
             model = normalizedModel(),
             oemLabel = oemLabel,
             icons = listOf(loadAirPlayIcon()),
+            videoPlayback = AirPlayVideoPlaybackConfig(
+                enabled = videoPlaybackEnabled,
+                allowed = true,
+            ),
         )
     }
 
@@ -3185,6 +3218,7 @@ class CarPlayHostActivity : ComponentActivity() {
                 "physical=${airPlayConfig.main.widthPhysicalMm}x" +
                 "${airPlayConfig.main.heightPhysicalMm}mm " +
                 "video=${if (airPlayConfig.hevc) "HEVC" else "H.264"} " +
+                "videoPlayback=${airPlayConfig.videoPlayback.enabled} " +
                 "decoder=${if (airPlayConfig.hevc && hevcSoftwareDecoderEnabled) "software" else "hardware"} " +
                 "microphone=${airPlayConfig.microphone} " +
                 "location=${if (config.locationReportingEnabled) "enabled" else "disabled"} " +
@@ -3488,6 +3522,13 @@ class CarPlayHostActivity : ComponentActivity() {
 
     private fun onHostTouch(view: View, event: MotionEvent): Boolean {
         if (menuOpen) return true
+        if (controller?.isVideoPlaybackActive() == true) {
+            if (videoPlaybackTouchSuppressionLogged.compareAndSet(false, true)) {
+                appendLog("Touch input is being consumed locally while CarPlay video playback owns the Surface")
+            }
+            return true
+        }
+        videoPlaybackTouchSuppressionLogged.set(false)
 
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {

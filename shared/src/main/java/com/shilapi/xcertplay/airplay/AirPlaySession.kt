@@ -9,12 +9,16 @@ import java.io.Closeable
 import java.math.BigInteger
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
+import java.net.Inet6Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.SecureRandom
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 data class AirPlayDeviceInfo(
     val name: String,
@@ -44,6 +48,7 @@ interface AirPlayMediaHandler {
     fun onSessionClosed(session: AirPlaySession) {}
     fun setIapTunnelHandler(handler: ((BlockingDuplexByteStream) -> Boolean)?) {}
     fun onSetupResponseSent(session: AirPlaySession) {}
+    fun videoPlaybackController(): VideoPlaybackController? = null
 }
 
 /**
@@ -61,18 +66,25 @@ class AirPlaySession(
     private val listener: AirPlaySessionListener,
     private val media: AirPlayMediaHandler,
 ) : Closeable {
+    internal data class ActiveStream(
+        val type: Int,
+        val clientTypeUuid: String? = null,
+    )
+
     internal val pairSetup = PairSetup(identity, pairings)
     internal val pairVerify = PairVerify(identity, pairings)
     internal var cipher: ControlCipher? = null
     internal var encBuf = ByteArray(0)
     internal var deviceBtMac = ""
-    internal val activeStreams = linkedSetOf<Int>()
+    internal val activeStreams = linkedSetOf<ActiveStream>()
 
     private val closed = AtomicBoolean(false)
     private val notified = AtomicBoolean(false)
     private var eventServer: ServerSocket? = null
     private var eventSocket: Socket? = null
     private var eventCipher: ControlCipher? = null
+    private var eventOutput: BufferedOutputStream? = null
+    private var controlOutput: BufferedOutputStream? = null
     private var eventCseq = 0
     private var pendingNightMode: Boolean? = null
     private val firstTouchSendLogged = AtomicBoolean(false)
@@ -81,7 +93,15 @@ class AirPlaySession(
     private var keepAliveSocket: DatagramSocket? = null
     private var keepAliveThread: Thread? = null
     private val eventWriteLock = Any()
+    private val controlWriteLock = Any()
     private val eventThreads = CopyOnWriteArrayList<Thread>()
+    private val streamIdCounter = AtomicLong(1)
+    private val random = SecureRandom()
+    /** Runtime playback-command RCS observed separately from the VideoSettings channel. */
+    @Volatile private var videoPlaybackRcs: VideoPlaybackRcsSession? = null
+    /** CarPlayVideoSettings RCS, opaque during the observed dedicated-channel bootstrap. */
+    @Volatile private var videoSettingsRcs: VideoPlaybackRcsSession? = null
+    @Volatile private var videoPlaybackDataStream: ApTransportDataStream? = null
 
     val host: String = socket.inetAddress?.hostAddress ?: ""
     val localAddress: InetAddress? = socket.localAddress
@@ -108,6 +128,7 @@ class AirPlaySession(
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         safeClose(socket)
+        closeVideoPlayback("AirPlay session closing")
         try {
             media.onSessionClosed(this)
         } catch (error: Exception) {
@@ -117,28 +138,54 @@ class AirPlaySession(
         if (notified.compareAndSet(false, true)) listener.onSessionEnded(this)
     }
 
+    fun isVideoPlaybackActive(): Boolean =
+        videoPlaybackRcs?.active == true || videoSettingsRcs?.active == true
+
+    fun sendVideoPlaybackBackButtonEvent(): Boolean =
+        (videoPlaybackRcs ?: videoSettingsRcs)?.sendBackButtonEvent() == true
+
     fun sendCommand(command: Map<String, Any?>): Boolean = synchronized(eventWriteLock) {
         sendCommandLocked(command)
     }
 
-    private fun sendCommandLocked(command: Map<String, Any?>): Boolean {
-        val socket = eventSocket ?: return false
+    private fun sendCommandLocked(command: Map<String, Any?>): Boolean =
+        sendCommandBodyLocked(
+            body = BplistCodec.encode(command),
+            streamId = null,
+            description = "type=${command["type"] ?: "missing"}",
+        )
+
+    private fun sendVideoPlaybackStreamCommand(streamId: Long, body: ByteArray): Boolean =
+        synchronized(eventWriteLock) {
+            sendCommandBodyLocked(
+                body = body,
+                streamId = streamId,
+                description = "videoPlayback streamID=$streamId",
+            )
+        }
+
+    private fun sendCommandBodyLocked(
+        body: ByteArray,
+        streamId: Long?,
+        description: String,
+    ): Boolean {
+        if (eventSocket == null) return false
         val cipher = eventCipher ?: return false
+        val output = eventOutput ?: return false
         eventCseq++
-        val body = BplistCodec.encode(command)
         val head = "POST /command RTSP/1.0\r\n" +
             "Content-Type: $PLIST_CONTENT_TYPE\r\n" +
+            (streamId?.let { "X-Apple-StreamID: $it\r\n" } ?: "") +
             "Content-Length: ${body.size}\r\n" +
             "CSeq: $eventCseq\r\n\r\n"
         trace("airplay event tx headers=$head bodyHex=${body.toHex()}")
         return try {
             val bytes = cipher.encrypt(head.toByteArray(Charsets.US_ASCII) + body)
-            val output = socket.getOutputStream()
             output.write(bytes)
             output.flush()
             true
         } catch (error: Exception) {
-            Log.w(TAG, "airplay event command failed type=${command["type"]}", error)
+            Log.w(TAG, "airplay event command failed $description", error)
             close()
             false
         }
@@ -247,6 +294,7 @@ class AirPlaySession(
     private fun runControl() {
         val input = BufferedInputStream(socket.getInputStream())
         val output = BufferedOutputStream(socket.getOutputStream())
+        controlOutput = output
         var accumulated = ByteArray(0)
         val buffer = ByteArray(READ_CHUNK_BYTES)
         var closeReason = "session closed"
@@ -272,54 +320,70 @@ class AirPlaySession(
                     plaintext = decrypted.data
                 }
                 accumulated += plaintext
-                val parsed = RtspMessage.parseMessages(accumulated)
-                accumulated = parsed.rest
-                for (request in parsed.messages) {
-                    val cseq = request.headers["cseq"] ?: "-"
-                    val path = request.path.lowercase()
-                    val showInDebugOverlay =
-                        !path.endsWith("/feedback") &&
-                            !(request.method == "POST" && path.endsWith("/command"))
-                    debugLog(
-                        "airplay rx ${request.method} ${request.path} cseq=$cseq body=${request.body.size}",
-                        showInDebugOverlay,
-                    )
-                    trace(
-                        "airplay control rx headers=${request.headers} " +
-                            "bodyHex=${request.body.toHex()}",
-                    )
-                    val response = try {
-                        handle(request)
-                    } catch (error: Exception) {
-                        Log.e(
-                            TAG,
-                            "airplay handler failed ${request.method} ${request.path} cseq=$cseq",
-                            error,
-                        )
-                        RtspMessage.Response(status = 500)
+                while (accumulated.isNotEmpty()) {
+                    if (ApTransportCodec.isPotentialPrefix(accumulated)) {
+                        val decoded = decodeSharedPacket(accumulated, SharedChannel.CONTROL) ?: break
+                        accumulated = decoded.rest
+                        handleSharedTransport(decoded.packet, SharedChannel.CONTROL)
+                        continue
                     }
-                    debugLog(
-                        "airplay tx status=${response.status ?: 200} cseq=$cseq body=${response.body.size}",
-                        showInDebugOverlay,
-                    )
-                    val wire = RtspMessage.buildResponse(request, response)
-                    trace("airplay control tx wireHex=${wire.toHex()}")
-                    output.write(cipher?.encrypt(wire) ?: wire)
-                    if (cipher == null && pairVerify.controlKeys != null) {
-                        val keys = pairVerify.controlKeys!!
-                        cipher = ControlCipher(keys.readKey, keys.writeKey)
-                        debugLog("airplay control encryption enabled")
-                    }
+                    val parsed = RtspMessage.parseFirst(accumulated)
+                    val request = parsed.messages.firstOrNull() ?: break
+                    accumulated = parsed.rest
+                    handleControlRequest(request)
                 }
-                output.flush()
                 notifySetupResponseSent()
             }
         } catch (error: Exception) {
             closeReason = "control I/O failed: ${error.message ?: error.javaClass.simpleName}"
             if (!closed.get()) Log.e(TAG, "airplay $closeReason", error)
         } finally {
+            controlOutput = null
             debugLog("airplay control closing reason=$closeReason activeStreams=$activeStreams")
             close()
+        }
+    }
+
+    private fun handleControlRequest(request: RtspMessage.Request) {
+        val cseq = request.headers["cseq"] ?: "-"
+        val path = request.path.lowercase()
+        val showInDebugOverlay =
+            !path.endsWith("/feedback") &&
+                !(request.method == "POST" && path.endsWith("/command"))
+        debugLog(
+            "airplay rx ${request.method} ${request.path} cseq=$cseq body=${request.body.size}",
+            showInDebugOverlay,
+        )
+        trace("airplay control rx headers=${request.headers} bodyHex=${request.body.toHex()}")
+        val response = try {
+            handle(request)
+        } catch (error: Exception) {
+            Log.e(TAG, "airplay handler failed ${request.method} ${request.path} cseq=$cseq", error)
+            RtspMessage.Response(status = 500)
+        }
+        debugLog(
+            "airplay tx status=${response.status ?: 200} cseq=$cseq body=${response.body.size}",
+            showInDebugOverlay,
+        )
+        val wire = RtspMessage.buildResponse(request, response)
+        trace("airplay control tx wireHex=${wire.toHex()}")
+        writeControl(wire)
+        if (cipher == null && pairVerify.controlKeys != null) {
+            val keys = pairVerify.controlKeys!!
+            cipher = ControlCipher(keys.readKey, keys.writeKey)
+            debugLog("airplay control encryption enabled")
+        }
+    }
+
+    private fun writeControl(plaintext: ByteArray): Boolean = synchronized(controlWriteLock) {
+        val output = controlOutput ?: return@synchronized false
+        return@synchronized try {
+            output.write(cipher?.encrypt(plaintext) ?: plaintext)
+            output.flush()
+            true
+        } catch (error: Exception) {
+            Log.w(TAG, "airplay shared control write failed", error)
+            false
         }
     }
 
@@ -367,6 +431,11 @@ class AirPlaySession(
                 debugLog(
                     "airplay /info audio=${if (config.wirelessAudio) "wireless PCM+Opus" else "wired PCM"} " +
                         "microphone=${config.microphone}",
+                )
+                debugLog(
+                    "airplay /info videoPlayback enabled=${config.videoPlayback.enabled} " +
+                        "playbackCapabilities=${info["playbackCapabilities"] ?: "omitted"} " +
+                        "videoPlaybackInfo=${info["videoPlaybackInfo"] ?: "omitted"}",
                 )
                 debugLog("airplay /info displays=${info["displays"]}")
                 RtspMessage.Response(
@@ -455,6 +524,21 @@ class AirPlaySession(
         features.add("iAPChannel")
         features.add("viewAreas")
         if (config.cluster != null) features.add("altScreen")
+        if (config.videoPlayback.enabled) {
+            // Experimental force switch: intentionally advertise the formal feature even when a
+            // peer omits it, while logging that deviation from normal intersection semantics.
+            val offered = (dict["features"] as? List<*>)?.any { it == "videoPlayback" } == true
+            features.add("videoPlayback")
+            val capabilities = config.videoPlayback.capabilities
+            debugLog(
+                "airplay videoPlayback force-enabled offeredByPhone=$offered " +
+                    "allowed=${config.videoPlayback.allowed} featuresEx=${config.videoPlayback.featuresEx} " +
+                    "offlineHLS=${capabilities.supportsOfflineHls} " +
+                    "v2Artwork=${capabilities.supportsV2ArtworkMetadata} " +
+                    "fpsSecureStop=${capabilities.supportsFpsSecureStop} " +
+                    "audioOnlyUI=${capabilities.supportsUiForAudioOnlyContent}",
+            )
+        }
         response["enabledFeatures"] = features
         return RtspMessage.Response(
             headers = mapOf("Content-Type" to PLIST_CONTENT_TYPE),
@@ -473,7 +557,7 @@ class AirPlaySession(
                     val port = media.onScreen(this, type, stream)
                     debugLog("airplay screen stream type=$type dataPort=${port ?: "rejected"}")
                     if (port != null) {
-                        activeStreams.add(type)
+                        activeStreams.add(ActiveStream(type))
                         result.add(linkedMapOf("type" to type, "dataPort" to port))
                     }
                 }
@@ -485,18 +569,39 @@ class AirPlaySession(
                             "controlPort=${streamResponse?.get("controlPort") ?: "none"}",
                     )
                     if (streamResponse != null) {
-                        activeStreams.add(type)
+                        activeStreams.add(ActiveStream(type))
                         result.add(streamResponse)
                     }
                 }
                 STREAM_TYPE_DATA -> {
-                    val streamResponse = media.onDataStream(this, stream)
+                    val uuid = string(stream["clientTypeUUID"]).uppercase()
+                    val streamResponse = when {
+                        uuid == VIDEO_PLAYBACK_UUID && config.videoPlayback.enabled ->
+                            setupVideoPlaybackStream(stream)
+                        uuid == VIDEO_PLAYBACK_CONTROL_UUID && config.videoPlayback.enabled ->
+                            setupVideoPlaybackControlStream(stream)
+                        uuid == VIDEO_PLAYBACK_UUID -> {
+                            debugLog(
+                                "AirPlay CarPlayVideoSettings SETUP rejected: experimental setting disabled",
+                            )
+                            null
+                        }
+                        uuid == VIDEO_PLAYBACK_CONTROL_UUID -> {
+                            debugLog(
+                                "AirPlay video playback control SETUP rejected: " +
+                                    "experimental setting disabled",
+                            )
+                            null
+                        }
+                        else -> media.onDataStream(this, stream)
+                    }
                     debugLog(
-                        "airplay data stream type=$type accepted=${streamResponse != null} " +
+                        "airplay data stream type=$type uuid=${uuid.ifEmpty { "missing" }} " +
+                            "accepted=${streamResponse != null} " +
                             "dataPort=${streamResponse?.get("dataPort") ?: "none"}",
                     )
                     if (streamResponse != null) {
-                        activeStreams.add(type)
+                        activeStreams.add(ActiveStream(type, uuid.ifEmpty { null }))
                         result.add(streamResponse)
                     }
                 }
@@ -506,7 +611,297 @@ class AirPlaySession(
         return result
     }
 
+    private fun setupVideoPlaybackStream(stream: Map<String, Any?>): Map<String, Any?>? {
+        val controlType = long(stream["controlType"])
+        val wantsDedicatedSocket = plistBoolean(stream["wantsDedicatedSocket"])
+        val sendMessageAsIs = plistBoolean(stream["sendMessageAsIs"])
+        val seed = unsignedPlistDecimal(stream["seed"])
+        debugLog(
+            "AirPlay CarPlayVideoSettings SETUP request keys=${stream.keys.sorted()} " +
+                "clientTypeUUID=${stream["clientTypeUUID"] ?: "missing"} " +
+                "clientUUID=${stream["clientUUID"] ?: "missing"} " +
+                "channelID=${stream["channelID"] ?: "missing"} " +
+                "controlType=${controlType ?: "missing"} " +
+                "seed=${seed ?: "missing"} " +
+                "dedicated=$wantsDedicatedSocket sendAsIs=$sendMessageAsIs",
+        )
+        debugLog(
+            "AirPlay CarPlayVideoSettings SETUP transport selection " +
+                "controlType=${controlType ?: "missing"} mode=" +
+                "${if (wantsDedicatedSocket) "dedicated" else "shared"} " +
+                "seedPresent=${seed != null} sendMessageAsIs=$sendMessageAsIs",
+        )
+        val controller = media.videoPlaybackController() ?: run {
+            debugLog("AirPlay CarPlayVideoSettings SETUP rejected: media backend has no VideoPlaybackController")
+            return null
+        }
+        closeVideoSettings("replacing CarPlayVideoSettings stream")
+        val streamId = streamIdCounter.getAndIncrement()
+        return if (wantsDedicatedSocket) {
+            setupDedicatedVideoPlaybackStream(
+                stream = stream,
+                streamId = streamId,
+                seed = seed,
+                sendMessageAsIs = sendMessageAsIs,
+                controller = controller,
+            )
+        } else {
+            setupSharedVideoPlaybackStream(
+                stream = stream,
+                streamId = streamId,
+                sendMessageAsIs = sendMessageAsIs,
+                controller = controller,
+            )
+        }
+    }
+
+    private fun setupDedicatedVideoPlaybackStream(
+        stream: Map<String, Any?>,
+        streamId: Long,
+        seed: String?,
+        sendMessageAsIs: Boolean,
+        controller: VideoPlaybackController,
+    ): Map<String, Any?>? {
+        if (seed == null) {
+            debugLog(
+                "AirPlay CarPlayVideoSettings dedicated SETUP rejected: " +
+                    "wantsDedicatedSocket=true but seed is missing or invalid",
+            )
+            return null
+        }
+        val shared = sharedSecret ?: run {
+            debugLog(
+                "AirPlay CarPlayVideoSettings dedicated SETUP rejected: " +
+                    "pair-verify shared secret unavailable",
+            )
+            return null
+        }
+        val salt = "DataStream-Salt$seed".toByteArray(Charsets.US_ASCII)
+        val readKey = AirPlayCrypto.hkdfSha512(
+            shared,
+            salt,
+            DATASTREAM_OUTPUT_KEY.toByteArray(Charsets.US_ASCII),
+            DATASTREAM_KEY_BYTES,
+        )
+        val writeKey = AirPlayCrypto.hkdfSha512(
+            shared,
+            salt,
+            DATASTREAM_INPUT_KEY.toByteArray(Charsets.US_ASCII),
+            DATASTREAM_KEY_BYTES,
+        )
+        val rcs = VideoPlaybackRcsSession(
+            streamId = streamId,
+            streamConnectionId = 0L,
+            sendMessageAsIs = sendMessageAsIs,
+            stopControllerOnClose = false,
+            controller = controller,
+            log = ::debugLog,
+        )
+        val transport = ApTransportDataStream(
+            readKey = readKey,
+            writeKey = writeKey,
+            bindAddress = videoPlaybackBindAddress(),
+        )
+        videoSettingsRcs = rcs
+        videoPlaybackDataStream = transport
+        val port = try {
+            transport.listen(
+                object : ApTransportDataStream.Listener {
+                    override fun onOpen(remoteAddress: String?) {
+                        debugLog(
+                            "AirPlay CarPlayVideoSettings dedicated DataStream connected " +
+                                "remote=${remoteAddress ?: "unknown"} streamID=$streamId seed=$seed",
+                        )
+                    }
+
+                    override fun onPacket(packet: ApTransportPackage) {
+                        handleDedicatedVideoPlaybackTransport(packet, transport, rcs)
+                    }
+
+                    override fun onDebug(message: String) {
+                        debugLog("AirPlay CarPlayVideoSettings $message")
+                    }
+
+                    override fun onClosed(cause: Throwable?) {
+                        debugLog(
+                            "AirPlay CarPlayVideoSettings dedicated DataStream closed " +
+                                "streamID=$streamId reason=" +
+                                "${cause?.message ?: "peer EOF"} active=${rcs.active}",
+                        )
+                        if (videoPlaybackDataStream === transport) {
+                            videoPlaybackDataStream = null
+                            if (videoSettingsRcs === rcs) videoSettingsRcs = null
+                            transport.close()
+                            rcs.close()
+                        }
+                    }
+                },
+            )
+        } catch (error: Throwable) {
+            debugLog(
+                "AirPlay CarPlayVideoSettings dedicated listener failed streamID=$streamId " +
+                    "error=${error.message ?: error.javaClass.simpleName}",
+            )
+            if (videoPlaybackDataStream === transport) videoPlaybackDataStream = null
+            if (videoSettingsRcs === rcs) videoSettingsRcs = null
+            transport.close()
+            rcs.close()
+            return null
+        }
+        debugLog(
+            "AirPlay CarPlayVideoSettings dedicated SETUP channelID=${stream["channelID"] ?: "missing"} " +
+                "controlType=${stream["controlType"] ?: "missing"} streamID=$streamId " +
+                "dataPort=$port seed=$seed sendMessageAsIs=$sendMessageAsIs",
+        )
+        return linkedMapOf(
+            "type" to STREAM_TYPE_DATA,
+            "streamID" to streamId,
+            "dataPort" to port,
+        )
+    }
+
+    private fun setupSharedVideoPlaybackStream(
+        stream: Map<String, Any?>,
+        streamId: Long,
+        sendMessageAsIs: Boolean,
+        controller: VideoPlaybackController,
+        assign: (VideoPlaybackRcsSession) -> Unit = { videoSettingsRcs = it },
+        label: String = "CarPlayVideoSettings",
+        stopControllerOnClose: Boolean = false,
+    ): Map<String, Any?> {
+        var connectionId = random.nextLong()
+        if (connectionId == 0L) connectionId = 1L
+        val rcs = VideoPlaybackRcsSession(
+            streamId = streamId,
+            streamConnectionId = connectionId,
+            sendMessageAsIs = sendMessageAsIs,
+            stopControllerOnClose = stopControllerOnClose,
+            controller = controller,
+            log = ::debugLog,
+        )
+        assign(rcs)
+        debugLog(
+            "AirPlay $label shared SETUP channelID=${stream["channelID"] ?: "missing"} " +
+                "controlType=${stream["controlType"] ?: "missing"} streamID=$streamId " +
+                "streamConnectionID=${java.lang.Long.toUnsignedString(connectionId)} " +
+                "sendMessageAsIs=$sendMessageAsIs",
+        )
+        return linkedMapOf(
+            "type" to STREAM_TYPE_DATA,
+            "streamID" to streamId,
+            "streamConnectionID" to unsignedPlistInteger(connectionId),
+        )
+    }
+
+    /**
+     * iOS 27 opens this controlType=1 RCS when a video-capable app starts playback. It is
+     * distinct from the dedicated CarPlayVideoSettings bootstrap channel and uses shared
+     * APTransport framing.
+     */
+    private fun setupVideoPlaybackControlStream(stream: Map<String, Any?>): Map<String, Any?>? {
+        val controller = media.videoPlaybackController() ?: run {
+            debugLog("AirPlay video playback control SETUP rejected: media backend unavailable")
+            return null
+        }
+        val controlType = long(stream["controlType"])
+        if (controlType != 1L) {
+            debugLog(
+                "AirPlay video playback control SETUP rejected: expected controlType=1 " +
+                    "actual=${controlType ?: "missing"} payload=$stream",
+            )
+            return null
+        }
+        closeVideoPlaybackControl("replacing playback command RCS")
+        val streamId = streamIdCounter.getAndIncrement()
+        val response = setupSharedVideoPlaybackStream(
+            stream = stream,
+            streamId = streamId,
+            sendMessageAsIs = false,
+            controller = controller,
+            assign = { videoPlaybackRcs = it },
+            label = "video-playback-control",
+            stopControllerOnClose = true,
+        )
+        debugLog(
+            "AirPlay video playback control SETUP accepted uuid=$VIDEO_PLAYBACK_CONTROL_UUID " +
+                "clientUUID=${stream["clientUUID"] ?: "missing"} " +
+                "channelID=${stream["channelID"] ?: "missing"} response=$response",
+        )
+        return response
+    }
+
+    private fun videoPlaybackBindAddress(): InetAddress = if (isWireless) {
+        InetAddress.getByName("::")
+    } else {
+        localAddress ?: when (remoteAddress) {
+            is Inet6Address -> InetAddress.getByName("::")
+            is Inet4Address -> InetAddress.getByName("0.0.0.0")
+            else -> InetAddress.getByName("0.0.0.0")
+        }
+    }
+
+    private fun closeVideoPlayback(reason: String) {
+        closeVideoPlaybackControl(reason)
+        closeVideoSettings(reason)
+    }
+
+    private fun closeVideoPlaybackControl(reason: String) {
+        val rcs = videoPlaybackRcs
+        videoPlaybackRcs = null
+        if (rcs != null) {
+            debugLog("AirPlay video playback control closing reason=$reason active=${rcs.active}")
+            rcs.close()
+        }
+    }
+
+    private fun closeVideoSettings(reason: String) {
+        val transport = videoPlaybackDataStream
+        val rcs = videoSettingsRcs
+        videoPlaybackDataStream = null
+        videoSettingsRcs = null
+        if (transport != null || rcs != null) {
+            debugLog(
+                "AirPlay CarPlayVideoSettings closing reason=$reason " +
+                    "transport=${if (transport == null) "shared/none" else "dedicated"} " +
+                    "rcsPresent=${rcs != null} active=${rcs?.active == true}",
+            )
+        }
+        transport?.close()
+        rcs?.close()
+    }
+
     private fun handleCommand(request: RtspMessage.Request): RtspMessage.Response {
+        val streamIdHeader = request.headers["x-apple-streamid"]
+        if (streamIdHeader != null) {
+            val streamId = streamIdHeader.toLongOrNull()
+            if (streamId == null) {
+                debugLog(
+                    "airplay RCS /command rejected: invalid X-Apple-StreamID=$streamIdHeader " +
+                        "body=${request.body.size}",
+                )
+                return RtspMessage.Response(status = 400)
+            }
+            val rcs = sequenceOf(videoPlaybackRcs, videoSettingsRcs)
+                .filterNotNull()
+                .firstOrNull { it.streamId == streamId }
+            if (rcs == null) {
+                debugLog(
+                    "airplay RCS /command has no session streamID=$streamId " +
+                        "playbackStream=${videoPlaybackRcs?.streamId ?: "none"} " +
+                        "settingsStream=${videoSettingsRcs?.streamId ?: "none"} " +
+                        "body=${request.body.size}",
+                )
+                return RtspMessage.Response(status = 200)
+            }
+            val handled = rcs.handleSharedCommand(request.body) { responseBody ->
+                sendVideoPlaybackStreamCommand(streamId, responseBody)
+            }
+            debugLog(
+                "airplay RCS /command streamID=$streamId handled=$handled " +
+                    "body=${request.body.size} active=${rcs.active}",
+            )
+            return RtspMessage.Response(status = 200)
+        }
         val body = try {
             asMap(BplistCodec.decode(request.body)) ?: emptyMap()
         } catch (_: Exception) {
@@ -526,36 +921,76 @@ class AirPlaySession(
             debugLog("airplay modesChanged resources=${resources ?: "missing"}")
         }
         if (type == "requestUI") listener.onHostUiRequested(this)
+        if (type == "ScreenMain") {
+            debugLog(
+                "airplay command ScreenMain: applying documented audio-only fallback " +
+                    "playbackRcs=${videoPlaybackRcs != null} settingsRcs=${videoSettingsRcs != null} " +
+                    "active=${isVideoPlaybackActive()}",
+            )
+            (videoPlaybackRcs ?: videoSettingsRcs)?.changeToAudioOnly()
+        }
         listener.onCommand(this, type, params)
         return RtspMessage.Response(status = 200)
     }
 
     private fun handleTeardown(request: RtspMessage.Request): RtspMessage.Response {
         var decodedBody: Any? = null
-        val types = try {
+        val requestedStreams = try {
             val decoded = BplistCodec.decode(request.body)
             decodedBody = decoded
             val dict = asMap(decoded)
             (dict?.get("streams") as? List<*>)
-                ?.mapNotNull { entry -> long(asMap(entry)?.get("type"))?.toInt() }
+                ?.mapNotNull { entry ->
+                    val stream = asMap(entry) ?: return@mapNotNull null
+                    val type = long(stream["type"])?.toInt() ?: return@mapNotNull null
+                    ActiveStream(type, string(stream["clientTypeUUID"]).uppercase().ifEmpty { null })
+                }
                 ?: emptyList()
         } catch (_: Exception) {
             emptyList()
         }
 
         debugLog(
-            "airplay TEARDOWN types=$types activeBefore=$activeStreams " +
+            "airplay TEARDOWN streams=$requestedStreams activeBefore=$activeStreams " +
                 "body=${request.body.size} bytes payload=$decodedBody",
         )
         trace("airplay TEARDOWN raw${request.body.size}Hex=${request.body.toHex()}")
 
-        if (types.isEmpty()) {
-            activeStreams.toList().forEach { media.onTeardown(this, it) }
+        if (requestedStreams.isEmpty()) {
+            activeStreams.toList().forEach(::teardownStream)
             activeStreams.clear()
         } else {
-            types.forEach { type -> if (activeStreams.remove(type)) media.onTeardown(this, type) }
+            requestedStreams.forEach { requested ->
+                val matches = activeStreams.filter { active ->
+                    active.type == requested.type &&
+                        (requested.clientTypeUuid == null || active.clientTypeUuid == requested.clientTypeUuid)
+                }
+                matches.forEach { active ->
+                    if (activeStreams.remove(active)) teardownStream(active)
+                }
+            }
         }
         return RtspMessage.Response(status = 200)
+    }
+
+    private fun teardownStream(stream: ActiveStream) {
+        if (stream.type == STREAM_TYPE_DATA && stream.clientTypeUuid == VIDEO_PLAYBACK_UUID) {
+            debugLog(
+                "airplay teardown CarPlayVideoSettings stream=$stream " +
+                    "transport=${if (videoPlaybackDataStream == null) "shared/none" else "dedicated"} " +
+                    "rcsPresent=${videoSettingsRcs != null}",
+            )
+            closeVideoSettings("RTSP TEARDOWN")
+        } else if (
+            stream.type == STREAM_TYPE_DATA &&
+            stream.clientTypeUuid == VIDEO_PLAYBACK_CONTROL_UUID
+        ) {
+            debugLog("airplay teardown video playback control stream=$stream")
+            closeVideoPlaybackControl("RTSP TEARDOWN")
+        } else {
+            debugLog("airplay teardown delegated stream=$stream")
+            media.onTeardown(this, stream.type)
+        }
     }
 
     private fun openTiming(peerPort: Int): Int {
@@ -604,6 +1039,7 @@ class AirPlaySession(
         eventServer = null
         safeClose(eventSocket)
         eventSocket = null
+        eventOutput = null
         eventCipher = null
         eventThreads.forEach { it.interrupt() }
         eventThreads.clear()
@@ -635,10 +1071,12 @@ class AirPlaySession(
                 32,
             )
             eventCipher = ControlCipher(readKey, writeKey)
+            val output = BufferedOutputStream(socket.getOutputStream())
+            eventOutput = output
             synchronized(eventWriteLock) {
                 sendPendingNightModeLocked()
             }
-            runEventRead(socket)
+            runEventRead(socket, output)
         } catch (error: Exception) {
             if (!closed.get()) {
                 Log.e(TAG, "airplay event accept failed", error)
@@ -647,10 +1085,9 @@ class AirPlaySession(
         }
     }
 
-    private fun runEventRead(socket: Socket) {
+    private fun runEventRead(socket: Socket, output: BufferedOutputStream) {
         try {
             val input = BufferedInputStream(socket.getInputStream())
-            val output = BufferedOutputStream(socket.getOutputStream())
             var encrypted = ByteArray(0)
             var plaintext = ByteArray(0)
             val buffer = ByteArray(READ_CHUNK_BYTES)
@@ -667,9 +1104,16 @@ class AirPlaySession(
                 }
                 encrypted = decrypted.rest
                 plaintext += decrypted.data
-                val parsed = RtspMessage.parseMessages(plaintext)
-                plaintext = parsed.rest
-                for (message in parsed.messages) {
+                while (plaintext.isNotEmpty()) {
+                    if (ApTransportCodec.isPotentialPrefix(plaintext)) {
+                        val decoded = decodeSharedPacket(plaintext, SharedChannel.EVENT) ?: break
+                        plaintext = decoded.rest
+                        handleSharedTransport(decoded.packet, SharedChannel.EVENT)
+                        continue
+                    }
+                    val parsed = RtspMessage.parseFirst(plaintext)
+                    val message = parsed.messages.firstOrNull() ?: break
+                    plaintext = parsed.rest
                     if (message.method.startsWith("RTSP/") || message.method.startsWith("HTTP/")) continue
                     debugLog(
                         "airplay event rx ${message.method} ${message.path} cseq=${message.headers["cseq"] ?: "-"} body=${message.body.size}",
@@ -680,10 +1124,7 @@ class AirPlaySession(
                             "bodyHex=${message.body.toHex()}",
                     )
                     trace("airplay event tx wireHex=${response.toHex()}")
-                    synchronized(eventWriteLock) {
-                        output.write(cipher.encrypt(response))
-                        output.flush()
-                    }
+                    writeEvent(response)
                 }
             }
         } catch (error: Exception) {
@@ -691,10 +1132,148 @@ class AirPlaySession(
         } finally {
             debugLog("airplay event connection closed")
             if (eventSocket === socket) eventSocket = null
+            eventOutput = null
             eventCipher = null
             safeClose(socket)
             if (!closed.get()) close()
         }
+    }
+
+    private fun writeEvent(plaintext: ByteArray): Boolean = synchronized(eventWriteLock) {
+        val cipher = eventCipher ?: return@synchronized false
+        val output = eventOutput ?: return@synchronized false
+        return@synchronized try {
+            output.write(cipher.encrypt(plaintext))
+            output.flush()
+            true
+        } catch (error: Exception) {
+            Log.w(TAG, "airplay shared event write failed", error)
+            false
+        }
+    }
+
+    private fun handleSharedTransport(packet: ApTransportPackage, channel: SharedChannel) {
+        debugLog(
+            "airplay APTransport channel=${channel.name.lowercase()} " +
+                "package=${ApTransportCodec.fourCcString(packet.packageType)} " +
+                "message=${if (packet.messageType == 0) "0" else ApTransportCodec.fourCcString(packet.messageType)} " +
+                "group=${java.lang.Long.toUnsignedString(packet.groupId)} payload=${packet.payload.size}",
+        )
+        val dedicatedActive = videoPlaybackDataStream != null
+        val candidates = buildList {
+            videoPlaybackRcs?.let(::add)
+            if (!dedicatedActive) videoSettingsRcs?.let(::add)
+        }
+        var owner: VideoPlaybackRcsSession? = null
+        val handled = candidates.any { candidate ->
+            val accepted = candidate.handle(
+                packet = packet,
+                reply = { response ->
+                    val bytes = ApTransportCodec.encode(response)
+                    when (channel) {
+                        SharedChannel.CONTROL -> writeControl(bytes)
+                        SharedChannel.EVENT -> writeEvent(bytes)
+                    }
+                },
+            )
+            if (accepted) owner = candidate
+            accepted
+        }
+        debugLog(
+                "airplay APTransport demux result channel=${channel.name.lowercase()} " +
+                "rcsCandidates=${candidates.size} owner=${owner?.streamId ?: "none"} " +
+                "dedicatedActive=$dedicatedActive " +
+                "handled=$handled group=${java.lang.Long.toUnsignedString(packet.groupId)}",
+        )
+        if (!handled && candidates.isNotEmpty() && packet.packageType == ApTransportCodec.TYPE_SYNC) {
+            debugLog(
+                "airplay APTransport replying unimplemented channel=${channel.name.lowercase()} " +
+                    "group=${java.lang.Long.toUnsignedString(packet.groupId)} " +
+                    "replyToken=${java.lang.Long.toUnsignedString(packet.replyToken)}",
+            )
+            val response = ApTransportPackage(
+                packageType = ApTransportCodec.TYPE_REPLY,
+                groupId = packet.groupId,
+                messageType = 0,
+                replyToken = packet.replyToken,
+                replyStatus = OSSTATUS_UNIMPLEMENTED,
+                payload = ByteArray(0),
+            )
+            when (channel) {
+                SharedChannel.CONTROL -> writeControl(ApTransportCodec.encode(response))
+                SharedChannel.EVENT -> writeEvent(ApTransportCodec.encode(response))
+            }
+        }
+    }
+
+    private fun handleDedicatedVideoPlaybackTransport(
+        packet: ApTransportPackage,
+        transport: ApTransportDataStream,
+        rcs: VideoPlaybackRcsSession,
+    ) {
+        if (videoPlaybackDataStream !== transport || videoSettingsRcs !== rcs) {
+            debugLog(
+                "AirPlay CarPlayVideoSettings dropping packet for stale dedicated stream " +
+                    "group=${java.lang.Long.toUnsignedString(packet.groupId)}",
+            )
+            return
+        }
+        val handled = rcs.handle(
+            packet = packet,
+            reply = transport::send,
+            acknowledgeOpaquePayload = true,
+        )
+        debugLog(
+            "AirPlay CarPlayVideoSettings dedicated demux result handled=$handled " +
+                "package=${ApTransportCodec.fourCcString(packet.packageType)} " +
+                "group=${java.lang.Long.toUnsignedString(packet.groupId)} active=${rcs.active}",
+        )
+        if (!handled && packet.packageType == ApTransportCodec.TYPE_SYNC) {
+            debugLog(
+                "AirPlay CarPlayVideoSettings dedicated replying unimplemented " +
+                    "group=${java.lang.Long.toUnsignedString(packet.groupId)} " +
+                    "replyToken=${java.lang.Long.toUnsignedString(packet.replyToken)}",
+            )
+            transport.send(
+                ApTransportPackage(
+                    packageType = ApTransportCodec.TYPE_REPLY,
+                    groupId = packet.groupId,
+                    messageType = 0,
+                    replyToken = packet.replyToken,
+                    replyStatus = OSSTATUS_UNIMPLEMENTED,
+                    payload = ByteArray(0),
+                ),
+            )
+        }
+    }
+
+    private fun decodeSharedPacket(
+        bytes: ByteArray,
+        channel: SharedChannel,
+    ): ApTransportCodec.Decoded? = try {
+        val decoded = ApTransportCodec.decodeFirst(bytes)
+        if (decoded == null) {
+            val declaredLength = if (bytes.size >= 4) {
+                ((bytes[0].toInt() and 0xff) shl 24) or
+                    ((bytes[1].toInt() and 0xff) shl 16) or
+                    ((bytes[2].toInt() and 0xff) shl 8) or
+                    (bytes[3].toInt() and 0xff)
+            } else {
+                null
+            }
+            debugLog(
+                "airplay APTransport partial channel=${channel.name.lowercase()} " +
+                    "buffered=${bytes.size} declaredLength=${declaredLength ?: "unknown"}",
+            )
+        }
+        decoded
+    } catch (error: IllegalArgumentException) {
+        debugLog(
+            "airplay APTransport invalid channel=${channel.name.lowercase()} buffered=${bytes.size} " +
+                "prefixHex=${bytes.copyOf(minOf(bytes.size, 64)).toHex()} " +
+                "error=${error.message ?: error.javaClass.simpleName}",
+        )
+        throw error
     }
 
     private fun spawnEvent(name: String, body: () -> Unit) {
@@ -702,6 +1281,8 @@ class AirPlaySession(
         eventThreads.add(thread)
         thread.start()
     }
+
+    private enum class SharedChannel { CONTROL, EVENT }
 
     private companion object {
         const val TAG = "xcertplay-usb"
@@ -715,6 +1296,12 @@ class AirPlaySession(
         const val STREAM_TYPE_ALT_AUDIO = 101
         const val STREAM_TYPE_MAIN_HIGH_AUDIO = 102
         const val STREAM_TYPE_DATA = 130
+        const val VIDEO_PLAYBACK_UUID = "BB493F61-A6B8-4769-8D74-80C23A9F71C4"
+        const val VIDEO_PLAYBACK_CONTROL_UUID = "A6B27562-B43A-4F2D-B75F-82391E250194"
+        const val OSSTATUS_UNIMPLEMENTED = -4
+        const val DATASTREAM_OUTPUT_KEY = "DataStream-Output-Encryption-Key"
+        const val DATASTREAM_INPUT_KEY = "DataStream-Input-Encryption-Key"
+        const val DATASTREAM_KEY_BYTES = 32
 
         const val READ_CHUNK_BYTES = 16 * 1024
         const val EVENT_READY_POLL_MILLIS = 25L
@@ -743,3 +1330,9 @@ private fun asMap(value: Any?): Map<String, Any?>? {
 private fun string(value: Any?): String = value as? String ?: ""
 
 private fun long(value: Any?): Long? = (value as? Number)?.toLong()
+
+private fun plistBoolean(value: Any?): Boolean = when (value) {
+    is Boolean -> value
+    is Number -> value.toInt() != 0
+    else -> false
+}

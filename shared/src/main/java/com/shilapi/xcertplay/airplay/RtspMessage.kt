@@ -35,10 +35,15 @@ object RtspMessage {
     )
 
     /** Parses as many complete messages as are buffered, retaining any partial remainder. */
-    fun parseMessages(buffer: ByteArray): Parsed {
+    fun parseMessages(buffer: ByteArray): Parsed = parse(buffer, Int.MAX_VALUE)
+
+    /** Parses at most one message, allowing a binary protocol to share the same connection. */
+    fun parseFirst(buffer: ByteArray): Parsed = parse(buffer, 1)
+
+    private fun parse(buffer: ByteArray, limit: Int): Parsed {
         val messages = ArrayList<Request>()
         var offset = 0
-        while (offset < buffer.size) {
+        while (offset < buffer.size && messages.size < limit) {
             val headerEndIndex = indexOf(buffer, headerEnd, offset) ?: break
             val headerText = String(buffer, offset, headerEndIndex - offset, Charsets.US_ASCII)
             val lines = headerText.split("\r\n")

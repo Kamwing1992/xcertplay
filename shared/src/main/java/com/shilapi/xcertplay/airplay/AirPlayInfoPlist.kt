@@ -73,6 +73,19 @@ object AirPlayInfoPlist {
             }
         }
         if (config.hevc) info["hevcInfo"] = emptyMap<String, Any?>()
+        if (config.videoPlayback.enabled) {
+            val capabilities = config.videoPlayback.capabilities
+            info["playbackCapabilities"] = linkedMapOf(
+                "supportsOfflineHLS" to capabilities.supportsOfflineHls,
+                "supportsV2ArtworkMetadata" to capabilities.supportsV2ArtworkMetadata,
+                "supportsFPSSecureStop" to capabilities.supportsFpsSecureStop,
+                "supportsUIForAudioOnlyContent" to capabilities.supportsUiForAudioOnlyContent,
+            )
+            info["videoPlaybackInfo"] = linkedMapOf(
+                "videoPlaybackAllowed" to config.videoPlayback.allowed,
+                "featuresEx" to config.videoPlayback.featuresEx,
+            )
+        }
         return info
     }
 

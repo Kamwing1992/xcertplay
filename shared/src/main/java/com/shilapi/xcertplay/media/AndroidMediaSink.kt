@@ -9,18 +9,35 @@ import android.media.MediaCodecList
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Surface
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
 import com.shilapi.xcertplay.airplay.AudioCodecKind
 import com.shilapi.xcertplay.airplay.AudioFormat
 import com.shilapi.xcertplay.airplay.MediaSink
 import com.shilapi.xcertplay.airplay.MicrophoneConfig
 import com.shilapi.xcertplay.airplay.VideoCodec
+import com.shilapi.xcertplay.airplay.VideoPlaybackController
+import com.shilapi.xcertplay.airplay.VideoPlaybackItem
+import com.shilapi.xcertplay.airplay.VideoPlaybackSnapshot
+import com.shilapi.xcertplay.airplay.VideoPlaybackTime
 import com.shilapi.xcertplay.airplay.toHexString
 import java.io.Closeable
+import java.net.URI
 import java.nio.ByteBuffer
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Android rendering backend for the CarPlay media engine. Video frames are
@@ -36,7 +53,7 @@ class AndroidMediaSink(
     private val advancedAudioChannelMapping: Boolean = false,
     private val microphoneGainPercent: Int = MicrophoneGain.DEFAULT_PERCENT,
     onScreenStreamActiveChanged: ((Int, Boolean) -> Unit)? = null,
-) : MediaSink {
+) : MediaSink, VideoPlaybackController {
     private val defaultSurface = surface
     @Volatile private var screenStreamActiveChanged = onScreenStreamActiveChanged
     private val surfaces = ConcurrentHashMap<Int, Surface>()
@@ -45,14 +62,44 @@ class AndroidMediaSink(
     private val microphoneUplinks = ConcurrentHashMap<Int, MicrophoneUplink>()
     private val videoRecoveryHandlers = ConcurrentHashMap<Int, () -> Boolean>()
     private val pendingVideoCodec = ConcurrentHashMap<Int, VideoCodec>()
+    private val playbackHandler = Handler(Looper.getMainLooper())
+    @Volatile private var playbackActive = false
+    private var playbackPlayer: ExoPlayer? = null
+    private val playbackItemIds = mutableListOf<String>()
+    private val playbackStartPositionsMs = mutableMapOf<String, Long>()
+
+    override val isVideoPlaybackActive: Boolean
+        get() = playbackActive
 
     fun setSurface(type: Int, surface: Surface) {
         surfaces[type] = surface
-        videoDecoders[type]?.setSurface(surface)
+        Log.i(
+            TAG,
+            "CarPlay video surface attached type=$type playbackActive=$playbackActive " +
+                "decoderPresent=${videoDecoders.containsKey(type)}",
+        )
+        if (playbackActive) {
+            if (type == STREAM_TYPE_MAIN_SCREEN) {
+                Log.i(TAG, "CarPlay video playback taking newly attached main Surface")
+                onPlaybackThread { player().setVideoSurface(surface) }
+            }
+        } else {
+            videoDecoders[type]?.setSurface(surface)
+        }
     }
 
     fun clearSurface(type: Int, surface: Surface) {
-        if (surfaces.remove(type, surface)) videoDecoders[type]?.setSurface(null)
+        if (!surfaces.remove(type, surface)) return
+        Log.i(
+            TAG,
+            "CarPlay video surface detached type=$type playbackActive=$playbackActive " +
+                "decoderPresent=${videoDecoders.containsKey(type)}",
+        )
+        if (playbackActive && type == STREAM_TYPE_MAIN_SCREEN) {
+            onPlaybackThread { playbackPlayer?.clearVideoSurface(surface) }
+        } else {
+            videoDecoders[type]?.setSurface(null)
+        }
     }
 
     fun setScreenStreamActiveChangedListener(listener: ((Int, Boolean) -> Unit)?) {
@@ -109,7 +156,198 @@ class AndroidMediaSink(
         microphoneUplinks.remove(type)?.close()
     }
 
+    override fun insert(item: VideoPlaybackItem, afterUuid: String?): Int {
+        val uri = try {
+            URI(item.contentLocation)
+        } catch (error: Exception) {
+            Log.w(TAG, "CarPlay video insert rejected: malformed URL", error)
+            return OSSTATUS_PARAM
+        }
+        if (uri.scheme?.lowercase() !in setOf("http", "https")) {
+            Log.w(TAG, "CarPlay video insert rejected: unsupported URL scheme=${uri.scheme ?: "missing"}")
+            return OSSTATUS_PARAM
+        }
+        return playbackCall(OSSTATUS_INTERNAL) {
+            val player = player()
+            val itemId = item.uuid ?: item.contentLocation
+            val startPositionMs = Math.round(item.startPositionSeconds.coerceAtLeast(0.0) * 1000.0)
+            Log.i(
+                TAG,
+                "CarPlay video insert id=$itemId after=${afterUuid ?: "head"} " +
+                    "startMs=$startPositionMs tls=${item.tlsEnabled} url=${redactUrl(uri)} " +
+                    "queueBefore=${queueSummary()}",
+            )
+            val mediaItem = MediaItem.Builder()
+                .setMediaId(itemId)
+                .setUri(item.contentLocation)
+                .setMimeType(MimeTypes.APPLICATION_M3U8)
+                .build()
+
+            val duplicateIndex = playbackItemIds.indexOf(itemId)
+            if (afterUuid != null && afterUuid != itemId && afterUuid !in playbackItemIds) {
+                Log.w(
+                    TAG,
+                    "CarPlay video insert rejected: itemAfter=$afterUuid not found " +
+                        "queue=${queueSummary()}",
+                )
+                return@playbackCall OSSTATUS_NOT_FOUND
+            }
+            if (afterUuid == itemId) {
+                Log.w(TAG, "CarPlay video insert rejected: item cannot be inserted after itself id=$itemId")
+                return@playbackCall OSSTATUS_PARAM
+            }
+            if (duplicateIndex >= 0) {
+                Log.i(TAG, "CarPlay video replacing duplicate id=$itemId oldIndex=$duplicateIndex")
+                player.removeMediaItem(duplicateIndex)
+                playbackItemIds.removeAt(duplicateIndex)
+            }
+            val insertionIndex = if (afterUuid == null) {
+                0
+            } else {
+                val afterIndex = playbackItemIds.indexOf(afterUuid)
+                if (afterIndex < 0) return@playbackCall OSSTATUS_NOT_FOUND
+                afterIndex + 1
+            }
+            val shouldStartPlayback = playbackItemIds.isEmpty() || !playbackActive
+            player.addMediaItem(insertionIndex, mediaItem)
+            playbackItemIds.add(insertionIndex, itemId)
+            playbackStartPositionsMs[itemId] = startPositionMs
+            if (shouldStartPlayback) {
+                activatePlaybackSurface(player)
+                player.seekTo(insertionIndex, startPositionMs)
+                player.prepare()
+            }
+            Log.i(
+                TAG,
+                "CarPlay video insert accepted id=$itemId index=$insertionIndex " +
+                    "prepared=$shouldStartPlayback queueAfter=${queueSummary()}",
+            )
+            0
+        }
+    }
+
+    override fun remove(uuid: String?): Int = playbackCall(OSSTATUS_INTERNAL) {
+        Log.i(TAG, "CarPlay video remove id=${uuid ?: "all"} queueBefore=${queueSummary()}")
+        if (uuid == null) {
+            stopPlayer("remove-without-id")
+            0
+        } else {
+            val index = playbackItemIds.indexOf(uuid)
+            if (index < 0) {
+                Log.w(TAG, "CarPlay video remove rejected: id=$uuid not found queue=${queueSummary()}")
+                OSSTATUS_NOT_FOUND
+            } else {
+                playbackPlayer?.removeMediaItem(index)
+                playbackStartPositionsMs.remove(playbackItemIds.removeAt(index))
+                if (playbackItemIds.isEmpty()) stopPlayer("queue-empty-after-remove")
+                Log.i(TAG, "CarPlay video remove completed id=$uuid queueAfter=${queueSummary()}")
+                0
+            }
+        }
+    }
+
+    override fun setRate(rate: Double): Int {
+        if (!rate.isFinite() || rate < 0.0 || rate > MAX_PLAYBACK_RATE) {
+            Log.w(TAG, "CarPlay video setRate rejected rate=$rate validRange=0..$MAX_PLAYBACK_RATE")
+            return OSSTATUS_PARAM
+        }
+        return playbackCall(OSSTATUS_INTERNAL) {
+            val player = player()
+            Log.i(
+                TAG,
+                "CarPlay video setRate rate=$rate state=${playbackStateName(player.playbackState)} " +
+                    "item=${player.currentMediaItem?.mediaId ?: "none"} queue=${queueSummary()}",
+            )
+            if (rate == 0.0) {
+                player.pause()
+            } else {
+                if (player.mediaItemCount > 0) activatePlaybackSurface(player)
+                player.playbackParameters = PlaybackParameters(rate.toFloat())
+                player.play()
+            }
+            0
+        }
+    }
+
+    override fun seek(time: VideoPlaybackTime): Int {
+        val seconds = time.seconds() ?: run {
+            Log.w(TAG, "CarPlay video seek rejected: invalid timescale=${time.timescale}")
+            return OSSTATUS_PARAM
+        }
+        if (!seconds.isFinite()) {
+            Log.w(TAG, "CarPlay video seek rejected: non-finite seconds=$seconds")
+            return OSSTATUS_PARAM
+        }
+        return playbackCall(OSSTATUS_INTERNAL) {
+            val positionMs = Math.round(seconds.coerceAtLeast(0.0) * 1000.0)
+            val player = player()
+            Log.i(
+                TAG,
+                "CarPlay video seek positionMs=$positionMs item=${player.currentMediaItem?.mediaId ?: "none"} " +
+                    "durationMs=${player.duration} state=${playbackStateName(player.playbackState)}",
+            )
+            player.seekTo(positionMs)
+            0
+        }
+    }
+
+    override fun stop(): Int = playbackCall(OSSTATUS_INTERNAL) {
+        stopPlayer("remote-stop-or-session-close")
+        0
+    }
+
+    override fun snapshot(): VideoPlaybackSnapshot = playbackCall(
+        VideoPlaybackSnapshot(0.0, 0.0, 0.0, false, emptyList(), emptyList()),
+    ) {
+        val player = playbackPlayer
+        if (player == null) {
+            VideoPlaybackSnapshot(0.0, 0.0, 0.0, false, emptyList(), emptyList())
+        } else {
+            val durationMs = player.duration.takeUnless { it == C.TIME_UNSET || it < 0 } ?: 0L
+            val positionMs = player.currentPosition.coerceAtLeast(0L)
+            val bufferedMs = player.bufferedPosition.coerceAtLeast(positionMs)
+            val loaded = if (bufferedMs > 0) {
+                listOf(timeRange(0L, bufferedMs))
+            } else {
+                emptyList()
+            }
+            val seekable = if (durationMs > 0 && player.isCurrentMediaItemSeekable) {
+                listOf(timeRange(0L, durationMs))
+            } else {
+                emptyList()
+            }
+            VideoPlaybackSnapshot(
+                durationSeconds = durationMs / 1000.0,
+                positionSeconds = positionMs / 1000.0,
+                rate = if (
+                    player.playWhenReady &&
+                    player.playbackState != Player.STATE_IDLE &&
+                    player.playbackState != Player.STATE_ENDED
+                ) {
+                    player.playbackParameters.speed.toDouble()
+                } else {
+                    0.0
+                },
+                readyToPlay = player.playbackState == Player.STATE_READY,
+                loadedTimeRanges = loaded,
+                seekableTimeRanges = seekable,
+            )
+        }
+    }
+
     fun close() {
+        playbackCall(Unit) {
+            Log.i(
+                TAG,
+                "CarPlay video player releasing active=$playbackActive queue=${queueSummary()} " +
+                    "playerPresent=${playbackPlayer != null}",
+            )
+            playbackPlayer?.release()
+            playbackPlayer = null
+            playbackActive = false
+            playbackItemIds.clear()
+            playbackStartPositionsMs.clear()
+        }
         videoDecoders.values.forEach(VideoDecoder::close)
         videoDecoders.clear()
         videoRecoveryHandlers.clear()
@@ -118,6 +356,192 @@ class AndroidMediaSink(
         audioRenderers.clear()
         microphoneUplinks.values.forEach(MicrophoneUplink::close)
         microphoneUplinks.clear()
+    }
+
+    private fun player(): ExoPlayer = playbackPlayer ?: ExoPlayer.Builder(context).build().also { next ->
+        Log.i(TAG, "CarPlay video ExoPlayer created")
+        next.setAudioAttributes(
+            androidx.media3.common.AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build(),
+            true,
+        )
+        next.addListener(
+            object : Player.Listener {
+                override fun onPlayerError(error: PlaybackException) {
+                    Log.e(
+                        TAG,
+                        "CarPlay URL video playback failed code=${error.errorCode} " +
+                            "name=${error.errorCodeName} item=${next.currentMediaItem?.mediaId ?: "none"} " +
+                            "positionMs=${next.currentPosition} bufferedMs=${next.bufferedPosition} " +
+                            "queue=${queueSummary()}",
+                        error,
+                    )
+                    deactivatePlaybackSurface(next)
+                }
+
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    Log.i(
+                        TAG,
+                        "CarPlay video player state=${playbackStateName(playbackState)} " +
+                            "playWhenReady=${next.playWhenReady} isPlaying=${next.isPlaying} " +
+                            "item=${next.currentMediaItem?.mediaId ?: "none"} " +
+                            "positionMs=${next.currentPosition} bufferedMs=${next.bufferedPosition}",
+                    )
+                    if (playbackState == Player.STATE_ENDED) deactivatePlaybackSurface(next)
+                }
+
+                override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    Log.i(
+                        TAG,
+                        "CarPlay video player isPlaying=$isPlaying playWhenReady=${next.playWhenReady} " +
+                            "state=${playbackStateName(next.playbackState)} " +
+                            "speed=${next.playbackParameters.speed}",
+                    )
+                }
+
+                override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    Log.i(
+                        TAG,
+                        "CarPlay video item transition id=${mediaItem?.mediaId ?: "none"} " +
+                            "reason=${transitionReasonName(reason)} index=${next.currentMediaItemIndex} " +
+                            "queue=${queueSummary()}",
+                    )
+                    if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) return
+                    val startPositionMs = mediaItem
+                        ?.mediaId
+                        ?.let(playbackStartPositionsMs::get)
+                        ?: return
+                    if (startPositionMs > 0L) {
+                        Log.i(
+                            TAG,
+                            "CarPlay video applying queued start position id=${mediaItem.mediaId} " +
+                                "startMs=$startPositionMs",
+                        )
+                        next.seekTo(startPositionMs)
+                    }
+                }
+            },
+        )
+        playbackPlayer = next
+    }
+
+    private fun activatePlaybackSurface(player: ExoPlayer) {
+        if (!playbackActive) {
+            Log.i(
+                TAG,
+                "CarPlay video activating Surface; detaching ${videoDecoders.size} mirror decoder(s) " +
+                    "mainSurfacePresent=${surfaces.containsKey(STREAM_TYPE_MAIN_SCREEN) || defaultSurface != null}",
+            )
+            playbackActive = true
+            videoDecoders.values.forEach { it.setSurface(null) }
+        }
+        (surfaces[STREAM_TYPE_MAIN_SCREEN] ?: defaultSurface)?.let(player::setVideoSurface)
+    }
+
+    private fun deactivatePlaybackSurface(player: ExoPlayer) {
+        if (!playbackActive) return
+        Log.i(
+            TAG,
+            "CarPlay video deactivating Surface; restoring mirror decoders=${videoDecoders.size} " +
+                "surfaces=${surfaces.keys.sorted()}",
+        )
+        player.clearVideoSurface()
+        playbackActive = false
+        surfaces.forEach { (type, surface) -> videoDecoders[type]?.setSurface(surface) }
+    }
+
+    private fun stopPlayer(reason: String) {
+        val player = playbackPlayer
+        Log.i(
+            TAG,
+            "CarPlay video stopping reason=$reason active=$playbackActive queue=${queueSummary()} " +
+                "state=${player?.playbackState?.let(::playbackStateName) ?: "no-player"} " +
+                "item=${player?.currentMediaItem?.mediaId ?: "none"}",
+        )
+        if (player != null) {
+            player.pause()
+            player.stop()
+            player.clearMediaItems()
+            deactivatePlaybackSurface(player)
+        }
+        playbackItemIds.clear()
+        playbackStartPositionsMs.clear()
+    }
+
+    private fun queueSummary(): String = playbackItemIds.joinToString(prefix = "[", postfix = "]")
+
+    private fun redactUrl(uri: URI): String = runCatching {
+        URI(uri.scheme, null, uri.host, uri.port, uri.path, null, null).toString()
+    }.getOrDefault("<invalid-url>")
+
+    private fun playbackStateName(state: Int): String = when (state) {
+        Player.STATE_IDLE -> "IDLE"
+        Player.STATE_BUFFERING -> "BUFFERING"
+        Player.STATE_READY -> "READY"
+        Player.STATE_ENDED -> "ENDED"
+        else -> "UNKNOWN($state)"
+    }
+
+    private fun transitionReasonName(reason: Int): String = when (reason) {
+        Player.MEDIA_ITEM_TRANSITION_REASON_AUTO -> "AUTO"
+        Player.MEDIA_ITEM_TRANSITION_REASON_SEEK -> "SEEK"
+        Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT -> "REPEAT"
+        Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED -> "PLAYLIST_CHANGED"
+        else -> "UNKNOWN($reason)"
+    }
+
+    private fun timeRange(startMs: Long, endMs: Long): Map<String, Any?> = linkedMapOf(
+        "start" to startMs / 1000.0,
+        "duration" to (endMs - startMs).coerceAtLeast(0L) / 1000.0,
+    )
+
+    private fun <T> playbackCall(fallback: T, block: () -> T): T {
+        if (Looper.myLooper() == playbackHandler.looper) {
+            return try {
+                block()
+            } catch (error: Throwable) {
+                Log.e(TAG, "CarPlay URL video playback operation failed", error)
+                fallback
+            }
+        }
+        val result = AtomicReference(fallback)
+        val complete = CountDownLatch(1)
+        if (!playbackHandler.post {
+                try {
+                    result.set(block())
+                } catch (error: Throwable) {
+                    Log.e(TAG, "CarPlay URL video playback operation failed", error)
+                } finally {
+                    complete.countDown()
+                }
+            }
+        ) {
+            return fallback
+        }
+        try {
+            if (!complete.await(PLAYBACK_COMMAND_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+                Log.w(TAG, "CarPlay URL video playback operation timed out")
+            }
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+        return result.get()
+    }
+
+    private fun onPlaybackThread(block: () -> Unit) {
+        if (Looper.myLooper() == playbackHandler.looper) block() else playbackHandler.post(block)
+    }
+
+    private companion object {
+        const val TAG = "xcertplay-usb"
+        const val STREAM_TYPE_MAIN_SCREEN = 110
+        const val OSSTATUS_PARAM = -50
+        const val OSSTATUS_NOT_FOUND = -43
+        const val OSSTATUS_INTERNAL = -1
+        const val MAX_PLAYBACK_RATE = 4.0
+        const val PLAYBACK_COMMAND_TIMEOUT_MILLIS = 5_000L
     }
 
     private fun videoDecoder(type: Int): VideoDecoder =

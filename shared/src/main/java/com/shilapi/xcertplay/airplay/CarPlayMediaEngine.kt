@@ -66,6 +66,8 @@ class CarPlayMediaEngine(
         iapTunnelHandler = handler
     }
 
+    override fun videoPlaybackController(): VideoPlaybackController? = sink as? VideoPlaybackController
+
     override fun onScreen(session: AirPlaySession, type: Int, stream: Map<String, Any?>): Int? {
         val key = outputKey(session, stream) ?: return null
         val streamKey = StreamKey(session, type)

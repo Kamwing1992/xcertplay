@@ -106,57 +106,8 @@ object MfiSapAuthSetup {
     }
 
     /** OPACK `{"baIC": intermediate}` used by Showcase and CarPlay Simulator. */
-    private fun encodeBaaIntermediate(intermediate: ByteArray): ByteArray {
-        val header = when {
-            intermediate.size <= 0x20 -> byteArrayOf(
-                0xE1.toByte(),
-                0x44,
-                'b'.code.toByte(),
-                'a'.code.toByte(),
-                'I'.code.toByte(),
-                'C'.code.toByte(),
-                (0x70 + intermediate.size).toByte(),
-            )
-
-            intermediate.size <= 0xFF -> byteArrayOf(
-                0xE1.toByte(),
-                0x44,
-                'b'.code.toByte(),
-                'a'.code.toByte(),
-                'I'.code.toByte(),
-                'C'.code.toByte(),
-                0x91.toByte(),
-                intermediate.size.toByte(),
-            )
-
-            intermediate.size <= 0xFFFF -> byteArrayOf(
-                0xE1.toByte(),
-                0x44,
-                'b'.code.toByte(),
-                'a'.code.toByte(),
-                'I'.code.toByte(),
-                'C'.code.toByte(),
-                0x92.toByte(),
-                intermediate.size.toByte(),
-                (intermediate.size ushr 8).toByte(),
-            )
-
-            else -> byteArrayOf(
-                0xE1.toByte(),
-                0x44,
-                'b'.code.toByte(),
-                'a'.code.toByte(),
-                'I'.code.toByte(),
-                'C'.code.toByte(),
-                0x93.toByte(),
-                intermediate.size.toByte(),
-                (intermediate.size ushr 8).toByte(),
-                (intermediate.size ushr 16).toByte(),
-                (intermediate.size ushr 24).toByte(),
-            )
-        }
-        return header + intermediate
-    }
+    private fun encodeBaaIntermediate(intermediate: ByteArray): ByteArray =
+        OpackCodec.encodeDictionary(linkedMapOf("baIC" to intermediate))
 
     private fun sha1(vararg parts: ByteArray): ByteArray = digest("SHA-1", parts)
 

@@ -346,6 +346,35 @@ class CarPlayController(
         }
     }
 
+    fun isVideoPlaybackActive(): Boolean =
+        !closed && activeSession?.isVideoPlaybackActive() == true
+
+    fun sendVideoPlaybackBackButtonEvent(): Boolean {
+        if (closed) {
+            debugLog("CarPlay video back event rejected: controller is closed")
+            return false
+        }
+        val session = activeSession ?: run {
+            debugLog("CarPlay video back event rejected: no active AirPlay session")
+            return false
+        }
+        return try {
+            touchExecutor.execute {
+                if (!closed && activeSession === session) {
+                    val sent = session.sendVideoPlaybackBackButtonEvent()
+                    debugLog("CarPlay video back event executed sent=$sent")
+                } else {
+                    debugLog("CarPlay video back event dropped: active session changed before execution")
+                }
+            }
+            debugLog("CarPlay video back event queued")
+            true
+        } catch (error: Exception) {
+            debugLog("CarPlay video back event could not be queued", error)
+            false
+        }
+    }
+
     private fun onIap2Incoming(frame: Iap2Frame) {
         if (frame.messageId != NOW_PLAYING_UPDATE) return
         try {

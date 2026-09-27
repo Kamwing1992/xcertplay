@@ -29,6 +29,33 @@ data class AirPlayIcon(
     val data: ByteArray,
 )
 
+/** Player features reported through /info.playbackCapabilities. */
+data class AirPlayPlaybackCapabilities(
+    val supportsOfflineHls: Boolean = false,
+    val supportsV2ArtworkMetadata: Boolean = false,
+    val supportsFpsSecureStop: Boolean = false,
+    val supportsUiForAudioOnlyContent: Boolean = true,
+)
+
+/** Experimental URL-fling video player advertised to CarPlay. */
+data class AirPlayVideoPlaybackConfig(
+    val enabled: Boolean = false,
+    val allowed: Boolean = true,
+    val featuresEx: String = FEATURES_EX_VIDEO_PLAYBACK,
+    val capabilities: AirPlayPlaybackCapabilities = AirPlayPlaybackCapabilities(),
+) {
+    init {
+        require(!enabled || featuresEx.isNotBlank()) {
+            "featuresEx is required when video playback is enabled"
+        }
+    }
+
+    companion object {
+        /** APFeature bit 70: byte 8, bit 6, standard base64 without padding. */
+        const val FEATURES_EX_VIDEO_PLAYBACK = "AAAAAAAAAABA"
+    }
+}
+
 /** Immutable accessory configuration consumed by the AirPlay session server. */
 data class AirPlayConfig(
     val deviceName: String,
@@ -48,4 +75,5 @@ data class AirPlayConfig(
     val model: String = "xcertplay",
     val oemLabel: String = "xcertplay",
     val icons: List<AirPlayIcon> = emptyList(),
+    val videoPlayback: AirPlayVideoPlaybackConfig = AirPlayVideoPlaybackConfig(),
 )

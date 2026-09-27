@@ -110,6 +110,15 @@ internal object OpackCodec {
                 0x32 -> readLittleEndian(4)
                 0x33 -> readLittleEndian(8)
                 in 0x40..0x60 -> readString(marker - 0x40)
+                // Strings longer than 32 bytes carry their length in the low nibble's byte count.
+                // The VideoSettings property keys ("property_key_...") need this form.
+                0x61 -> readString(readLittleEndian(1).toInt())
+                0x62 -> readString(readLittleEndian(2).toInt())
+                0x63 -> {
+                    val length = readLittleEndian(4)
+                    require(length <= Int.MAX_VALUE) { "OPACK string is too large" }
+                    readString(length.toInt())
+                }
                 in 0x70..0x90 -> readBytes(marker - 0x70)
                 0x91 -> readBytes(readLittleEndian(1).toInt())
                 0x92 -> readBytes(readLittleEndian(2).toInt())

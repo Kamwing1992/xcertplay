@@ -307,6 +307,16 @@ internal class VideoPlaybackRcsSession(
         }
         val kind = message["kind"] as? String
         val messageId = message["messageID"] as? Number
+        if (kind == "response" || kind == "notification") {
+            // The phone also sends its own replies and notifications on this channel. They carry
+            // no request to answer, so acknowledge them at the transport layer rather than
+            // reporting OSStatus -4 for what looks like an unknown command.
+            log(
+                "CarPlayVideoSettings peer $kind messageID=${messageId ?: "none"} " +
+                    "keys=${message.keys.sorted()}",
+            )
+            return Outcome()
+        }
         return when (message["type"] as? String) {
             "insertPlayQueueItem" -> {
                 val item = parseItem(message)

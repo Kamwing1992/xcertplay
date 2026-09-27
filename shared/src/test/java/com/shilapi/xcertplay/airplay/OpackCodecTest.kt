@@ -35,6 +35,30 @@ class OpackCodecTest {
     }
 
     @Test
+    fun decodesPropertyKeysLongerThanTheInlineStringLimit() {
+        // From the phone's VideoSettings bootstrap: both property keys exceed the 32-byte inline
+        // OPACK string limit, so they use the 0x61 one-byte-length form.
+        val firstKey = "property_key_ClosedCaptionsAndSDH_Enabled"
+        val secondKey = "property_key_captionstyles_selectedstyle"
+        assertEquals(41, firstKey.length)
+        assertEquals(40, secondKey.length)
+
+        val encoded = byteArrayOf(
+            0xE1.toByte(),
+            0x44, 'd'.code.toByte(), 'a'.code.toByte(), 't'.code.toByte(), 'a'.code.toByte(),
+            0xE2.toByte(),
+            0x61, firstKey.length.toByte(),
+        ) + firstKey.toByteArray() + byteArrayOf(
+            0x02,
+            0x61, secondKey.length.toByte(),
+        ) + secondKey.toByteArray() + byteArrayOf(0x01)
+
+        val settings = OpackCodec.decodeDictionary(encoded)["data"] as Map<*, *>
+        assertEquals(false, settings[firstKey])
+        assertEquals(true, settings[secondKey])
+    }
+
+    @Test
     fun decodesNestedVideoSettingsDictionary() {
         val encoded = byteArrayOf(
             0xE2.toByte(),

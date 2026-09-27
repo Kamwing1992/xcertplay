@@ -4,8 +4,8 @@ package com.shilapi.xcertplay.airplay
  * Minimal Apple binary property list (bplist00) codec for the CarPlay control channel.
  *
  * It covers the subset the stack emits and reads: dictionaries, arrays, ASCII and UTF-16
- * strings, raw data, signed/unsigned integers, 32/64-bit reals, and booleans. Dictionary keys are
- * serialized in insertion order, matching the reference implementation this stack targets.
+ * strings, raw data, dates, signed/unsigned integers, 32/64-bit reals, and booleans. Dictionary
+ * keys are serialized in insertion order, matching the reference implementation this stack targets.
  */
 object BplistCodec {
     private val magic = "bplist00".toByteArray(Charsets.US_ASCII)
@@ -145,6 +145,14 @@ object BplistCodec {
                     8 -> Double.fromBits(readBigEndianLong(bytes, position.toLong(), size))
                     else -> throw IllegalArgumentException("bplist: unsupported real size $size")
                 }
+            }
+            0x3 -> {
+                // A binary plist date is an 8-byte big-endian double holding CFAbsoluteTime,
+                // the seconds since 2001-01-01T00:00:00Z. CarPlay playback items carry it as
+                // "Start-Date"; omitting this branch made the whole item dictionary undecodable,
+                // so the command was dropped instead of played.
+                require(nibble == 0x3) { "bplist: unsupported date marker 0x3$nibble" }
+                Double.fromBits(readBigEndianLong(bytes, position.toLong(), 8))
             }
             0x4 -> {
                 val count = readCount()

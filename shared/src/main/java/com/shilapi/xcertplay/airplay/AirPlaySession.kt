@@ -16,6 +16,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.security.SecureRandom
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -69,6 +70,12 @@ class AirPlaySession(
     internal data class ActiveStream(
         val type: Int,
         val clientTypeUuid: String? = null,
+        /**
+         * The streamID this session returned in SETUP. The phone echoes it in TEARDOWN, and
+         * several type-130 streams can share a type and a missing clientTypeUUID, so tearing a
+         * stream down by type alone would close unrelated streams.
+         */
+        val streamId: Long? = null,
     )
 
     internal val pairSetup = PairSetup(identity, pairings)
@@ -97,8 +104,12 @@ class AirPlaySession(
     private val eventThreads = CopyOnWriteArrayList<Thread>()
     private val streamIdCounter = AtomicLong(1)
     private val random = SecureRandom()
-    /** Runtime playback-command RCS observed separately from the VideoSettings channel. */
-    @Volatile private var videoPlaybackRcs: VideoPlaybackRcsSession? = null
+    /**
+     * Runtime playback-command RCS sessions keyed by the streamID returned in SETUP. The phone
+     * replaces this channel whenever it starts a new playback session, and it still addresses the
+     * previous one by streamID while shutting it down, so both must stay individually reachable.
+     */
+    private val videoPlaybackRcs = ConcurrentHashMap<Long, VideoPlaybackRcsSession>()
     /** CarPlayVideoSettings RCS, opaque during the observed dedicated-channel bootstrap. */
     @Volatile private var videoSettingsRcs: VideoPlaybackRcsSession? = null
     @Volatile private var videoPlaybackDataStream: ApTransportDataStream? = null
@@ -139,10 +150,11 @@ class AirPlaySession(
     }
 
     fun isVideoPlaybackActive(): Boolean =
-        videoPlaybackRcs?.active == true || videoSettingsRcs?.active == true
+        videoPlaybackRcs.values.any { it.active } || videoSettingsRcs?.active == true
 
     fun sendVideoPlaybackBackButtonEvent(): Boolean =
-        (videoPlaybackRcs ?: videoSettingsRcs)?.sendBackButtonEvent() == true
+        (videoPlaybackRcs.values.firstOrNull { it.active } ?: videoSettingsRcs)
+            ?.sendBackButtonEvent() == true
 
     fun sendCommand(command: Map<String, Any?>): Boolean = synchronized(eventWriteLock) {
         sendCommandLocked(command)
@@ -601,7 +613,19 @@ class AirPlaySession(
                             "dataPort=${streamResponse?.get("dataPort") ?: "none"}",
                     )
                     if (streamResponse != null) {
-                        activeStreams.add(ActiveStream(type, uuid.ifEmpty { null }))
+                        // Only the video playback channels are addressed by a streamID this
+                        // session allocates. The media engine reports a fixed streamID for its
+                        // own streams, which would collide with that range.
+                        val allocatedStreamId = if (
+                            uuid == VIDEO_PLAYBACK_UUID || uuid == VIDEO_PLAYBACK_CONTROL_UUID
+                        ) {
+                            long(streamResponse["streamID"])
+                        } else {
+                            null
+                        }
+                        activeStreams.add(
+                            ActiveStream(type, uuid.ifEmpty { null }, allocatedStreamId),
+                        )
                         result.add(streamResponse)
                     }
                 }
@@ -818,7 +842,7 @@ class AirPlaySession(
             streamId = streamId,
             sendMessageAsIs = false,
             controller = controller,
-            assign = { videoPlaybackRcs = it },
+            assign = { videoPlaybackRcs[streamId] = it },
             label = "video-playback-control",
             stopControllerOnClose = true,
         )
@@ -845,11 +869,22 @@ class AirPlaySession(
         closeVideoSettings(reason)
     }
 
-    private fun closeVideoPlaybackControl(reason: String) {
-        val rcs = videoPlaybackRcs
-        videoPlaybackRcs = null
-        if (rcs != null) {
-            debugLog("AirPlay video playback control closing reason=$reason active=${rcs.active}")
+    private fun closeVideoPlaybackControl(reason: String) = closeVideoPlaybackControl(null, reason)
+
+    /** Closes one playback-command RCS, or every one when [streamId] is null. */
+    private fun closeVideoPlaybackControl(streamId: Long?, reason: String) {
+        val closing = if (streamId == null) {
+            val all = videoPlaybackRcs.values.toList()
+            videoPlaybackRcs.clear()
+            all
+        } else {
+            listOfNotNull(videoPlaybackRcs.remove(streamId))
+        }
+        closing.forEach { rcs ->
+            debugLog(
+                "AirPlay video playback control closing reason=$reason " +
+                    "streamID=${rcs.streamId} active=${rcs.active}",
+            )
             rcs.close()
         }
     }
@@ -881,13 +916,12 @@ class AirPlaySession(
                 )
                 return RtspMessage.Response(status = 400)
             }
-            val rcs = sequenceOf(videoPlaybackRcs, videoSettingsRcs)
-                .filterNotNull()
-                .firstOrNull { it.streamId == streamId }
+            val rcs = videoPlaybackRcs[streamId]
+                ?: videoSettingsRcs?.takeIf { it.streamId == streamId }
             if (rcs == null) {
                 debugLog(
                     "airplay RCS /command has no session streamID=$streamId " +
-                        "playbackStream=${videoPlaybackRcs?.streamId ?: "none"} " +
+                        "playbackStreams=${videoPlaybackRcs.keys.sorted()} " +
                         "settingsStream=${videoSettingsRcs?.streamId ?: "none"} " +
                         "body=${request.body.size}",
                 )
@@ -924,10 +958,10 @@ class AirPlaySession(
         if (type == "ScreenMain") {
             debugLog(
                 "airplay command ScreenMain: applying documented audio-only fallback " +
-                    "playbackRcs=${videoPlaybackRcs != null} settingsRcs=${videoSettingsRcs != null} " +
+                    "playbackRcs=${videoPlaybackRcs.size} settingsRcs=${videoSettingsRcs != null} " +
                     "active=${isVideoPlaybackActive()}",
             )
-            (videoPlaybackRcs ?: videoSettingsRcs)?.changeToAudioOnly()
+            (videoPlaybackRcs.values.firstOrNull() ?: videoSettingsRcs)?.changeToAudioOnly()
         }
         listener.onCommand(this, type, params)
         return RtspMessage.Response(status = 200)
@@ -943,7 +977,11 @@ class AirPlaySession(
                 ?.mapNotNull { entry ->
                     val stream = asMap(entry) ?: return@mapNotNull null
                     val type = long(stream["type"])?.toInt() ?: return@mapNotNull null
-                    ActiveStream(type, string(stream["clientTypeUUID"]).uppercase().ifEmpty { null })
+                    ActiveStream(
+                        type = type,
+                        clientTypeUuid = string(stream["clientTypeUUID"]).uppercase().ifEmpty { null },
+                        streamId = long(stream["streamID"]),
+                    )
                 }
                 ?: emptyList()
         } catch (_: Exception) {
@@ -961,9 +999,18 @@ class AirPlaySession(
             activeStreams.clear()
         } else {
             requestedStreams.forEach { requested ->
+                // Match on the narrowest identity the phone supplied. A TEARDOWN that names a
+                // streamID must never widen to every stream of that type: the iAP tunnel, the
+                // VideoSettings bootstrap and the playback RCS all share type 130.
                 val matches = activeStreams.filter { active ->
-                    active.type == requested.type &&
-                        (requested.clientTypeUuid == null || active.clientTypeUuid == requested.clientTypeUuid)
+                    when {
+                        requested.streamId != null ->
+                            active.streamId == requested.streamId && active.type == requested.type
+                        requested.clientTypeUuid != null ->
+                            active.type == requested.type &&
+                                active.clientTypeUuid == requested.clientTypeUuid
+                        else -> active.type == requested.type
+                    }
                 }
                 matches.forEach { active ->
                     if (activeStreams.remove(active)) teardownStream(active)
@@ -986,7 +1033,7 @@ class AirPlaySession(
             stream.clientTypeUuid == VIDEO_PLAYBACK_CONTROL_UUID
         ) {
             debugLog("airplay teardown video playback control stream=$stream")
-            closeVideoPlaybackControl("RTSP TEARDOWN")
+            closeVideoPlaybackControl(stream.streamId, "RTSP TEARDOWN")
         } else {
             debugLog("airplay teardown delegated stream=$stream")
             media.onTeardown(this, stream.type)
@@ -1161,7 +1208,7 @@ class AirPlaySession(
         )
         val dedicatedActive = videoPlaybackDataStream != null
         val candidates = buildList {
-            videoPlaybackRcs?.let(::add)
+            addAll(videoPlaybackRcs.values)
             if (!dedicatedActive) videoSettingsRcs?.let(::add)
         }
         var owner: VideoPlaybackRcsSession? = null
